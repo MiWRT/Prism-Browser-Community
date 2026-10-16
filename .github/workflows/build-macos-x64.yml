@@ -1,0 +1,122 @@
+# 为 Intel 芯片的 Mac 构建 Prism Browser（macOS x64）
+#
+# 背景：
+# - 官方发布包只有 macOS arm64，没有 Intel（x64）版本
+# - GitHub 的 Intel runner（macos-13）已于 2025-12 下线，这里在免费的
+#   arm64 runner（macos-15）上用 electron-builder --x64 交叉编译 x64 安装包
+# - Electron 43 要求 macOS 12+，在 macOS 12.7.6 上可以运行
+# - 默认会把 ungoogled-chromium 的 x64 内核打包进应用，开箱即用。
+#   注意：Chrome 150 是最后一个支持 macOS 12 的大版本，所以内核版本不能超过 150.x
+#
+# 使用：仓库 Actions 页 -> "Build macOS Intel (x64)" -> Run workflow ->
+#       构建完成后在 Artifacts 里下载 dmg/zip
+
+name: Build macOS Intel (x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_kernel:
+        description: '是否把 x64 内核打包进应用（推荐开启，macOS 12 开箱即用）'
+        required: false
+        default: true
+        type: boolean
+      kernel_tag:
+        description: '内核版本 tag（主版本必须 <= 150，Chrome 150 是最后一个支持 macOS 12 的版本）'
+        required: false
+        default: '150.0.7871.46-1.1'
+
+jobs:
+  build:
+    name: Build Prism Browser for macOS x64
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      # 没有 Apple 开发者证书时跳过代码签名。
+      # 未签名的应用首次打开会被 GateKeeper 拦截：右键 -> 打开即可，
+      # 或执行 xattr -cr "/Applications/Prism Browser.app" 后再打开。
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck + build renderer/main
+        run: npm run build
+
+      - name: Download x64 kernel (ungoogled-chromium)
+        if: ${{ inputs.bundle_kernel }}
+        run: |
+          set -euo pipefail
+          TAG='${{ inputs.kernel_tag }}'
+          API="https://api.github.com/repos/ungoogled-software/ungoogled-chromium-macos/releases/tags/${TAG}"
+          echo "查询内核 release: ${API}"
+          URL="$(curl -fsSL "${API}" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          matches = [a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('_x86_64-macos.dmg')]
+          if not matches:
+              raise SystemExit('release 里没有找到 x86_64-macos.dmg')
+          print(matches[0])
+          ")"
+          echo "下载: ${URL}"
+          curl -fSL --retry 3 -o /tmp/prism-kernel.dmg "${URL}"
+          hdiutil attach -nobrowse -mountpoint /Volumes/prism-kernel /tmp/prism-kernel.dmg
+          ls /Volumes/prism-kernel
+          test -d '/Volumes/prism-kernel/Chromium.app' || { echo 'DMG 中没有找到 Chromium.app'; exit 1; }
+          mkdir -p kernel-staging/kernels/current
+          ditto '/Volumes/prism-kernel/Chromium.app' kernel-staging/kernels/current/Chromium.app
+          hdiutil detach /Volumes/prism-kernel
+          rm -f /tmp/prism-kernel.dmg
+          KERNEL_VERSION="${TAG%%-*}"
+          echo "内核版本: ${KERNEL_VERSION}"
+          python3 - "${KERNEL_VERSION}" <<'PYEOF'
+          import json, sys
+          manifest = {
+              "schemaVersion": 1,
+              "version": sys.argv[1],
+              "executableRelative": "Chromium.app/Contents/MacOS/Chromium",
+              "target": "darwin-x64",
+          }
+          with open("kernel-staging/kernels/current/manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          print(json.dumps(manifest, indent=2))
+          PYEOF
+          test -x kernel-staging/kernels/current/Chromium.app/Contents/MacOS/Chromium
+          echo "内核已就绪"
+
+      - name: Package macOS x64 (dmg + zip)
+        run: |
+          set -euo pipefail
+          node -e "
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const config = { ...pkg.build };
+          if ('${{ inputs.bundle_kernel }}' === 'true') {
+            config.extraResources = [{ from: 'kernel-staging/kernels', to: 'kernels' }];
+          }
+          fs.writeFileSync('electron-builder.mac-x64.json', JSON.stringify(config, null, 2));
+          console.log('electron-builder config written');
+          "
+          npx electron-builder --config electron-builder.mac-x64.json --mac dmg zip --x64
+
+      - name: Show artifacts
+        run: ls -lh release/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-browser-mac-x64
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 30
