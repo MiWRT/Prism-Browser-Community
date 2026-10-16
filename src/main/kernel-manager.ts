@@ -58,7 +58,12 @@ interface KernelActivationBackup {
 }
 
 function supportedAsset(assets: GithubAsset[]): GithubAsset | undefined {
-  if (process.platform === 'darwin') return assets.find((asset) => asset.name.endsWith('_macos.dmg'))
+  if (process.platform === 'darwin') {
+    // 上游内核发行包目前只有 macOS arm64（_macos.dmg）。Intel 机型上不提供
+    // 下载入口，避免下到无法运行的 arm64 内核；以后若发布 x64 包会自动启用。
+    if (process.arch === 'arm64') return assets.find((asset) => asset.name.endsWith('_macos.dmg'))
+    return assets.find((asset) => asset.name.endsWith('_x86_64-macos.dmg') || asset.name.endsWith('_macos-x64.dmg'))
+  }
   if (process.platform === 'win32') return assets.find((asset) => asset.name.endsWith('_windows_x64.zip'))
   return undefined
 }
