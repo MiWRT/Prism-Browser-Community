@@ -106,7 +106,7 @@ jobs:
           fs.writeFileSync('electron-builder.mac-x64.json', JSON.stringify(config, null, 2));
           console.log('electron-builder config written');
           "
-          npx electron-builder --config electron-builder.mac-x64.json --mac dmg zip --x64
+          npx electron-builder --config electron-builder.mac-x64.json --mac dmg zip --x64 --publish never
 
       - name: Show artifacts
         run: ls -lh release/
