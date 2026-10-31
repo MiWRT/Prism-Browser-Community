@@ -18,6 +18,13 @@
 #   且 Chrome 156 要求 macOS 13 或更高，正好落在 13.7.8 上）
 # - 内核 tag 仍可手动改：主版本建议 >= 151；如果填了 <= 150，构建不会失败，
 #   但会打印警告，因为那是 Monterey 时代的旧内核，在 Ventura 上没必要用
+# - 2026-10-31 修复：内核下载不再先调 GitHub API。旧写法用 curl 不带认证调
+#   api.github.com 查 asset 地址，在共享 runner IP 上很容易撞到未认证限流
+#   （60 次/小时），GitHub 直接回 403，curl -f 失败后空输入进 python，
+#   就会报你看到的 JSONDecodeError。tag 本身没错，156.0.8078.47-1.1
+#   的 x86_64 包确实存在。新写法按固定规则拼直链先下，直链走
+#   github.com/releases/download，不走 API 限流；直链万一 404 才兜底
+#   走带 GITHUB_TOKEN 认证的 API 查询（Actions 自带 token，不用另外配 secret）
 #
 # 使用：仓库 Actions 页 -> "Build macOS Intel (x64) for Ventura 13" -> Run workflow ->
 #       构建完成后在 Artifacts 里下载 dmg/zip
@@ -79,18 +86,24 @@ jobs:
           if [ "${MAJOR}" -lt 151 ]; then
             echo "::warning::内核主版本 ${MAJOR} 是 Monterey（macOS 12）时代的版本，在 Ventura 13.7.8 上建议用 151 或更高（默认 156.0.8078.47-1.1），构建继续，不强制失败"
           fi
-          API="https://api.github.com/repos/ungoogled-software/ungoogled-chromium-macos/releases/tags/${TAG}"
-          echo "查询内核 release: ${API}"
-          URL="$(curl -fsSL "${API}" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          matches = [a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('_x86_64-macos.dmg')]
-          if not matches:
-              raise SystemExit('release 里没有找到 x86_64-macos.dmg')
-          print(matches[0])
-          ")"
-          echo "下载: ${URL}"
-          curl -fSL --retry 3 -o /tmp/prism-kernel.dmg "${URL}"
+          ASSET="ungoogled-chromium_${TAG}_x86_64-macos.dmg"
+          URL="https://github.com/ungoogled-software/ungoogled-chromium-macos/releases/download/${TAG}/${ASSET}"
+          echo "直接下载（不走 GitHub API，避开共享 runner IP 的未认证限流）: ${URL}"
+          if ! curl -fSL --retry 3 -o /tmp/prism-kernel.dmg "${URL}"; then
+            echo "直链下载失败，兜底走带 GITHUB_TOKEN 认证的 API 查询 asset 地址"
+            API="https://api.github.com/repos/ungoogled-software/ungoogled-chromium-macos/releases/tags/${TAG}"
+            echo "查询内核 release: ${API}"
+            URL="$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "User-Agent: prism-browser-build" "${API}" | python3 -c "
+            import json, sys
+            data = json.load(sys.stdin)
+            matches = [a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('_x86_64-macos.dmg')]
+            if not matches:
+                raise SystemExit('release 里没有找到 x86_64-macos.dmg')
+            print(matches[0])
+            ")"
+            echo "下载: ${URL}"
+            curl -fSL --retry 3 -o /tmp/prism-kernel.dmg "${URL}"
+          fi
           hdiutil attach -nobrowse -mountpoint /Volumes/prism-kernel /tmp/prism-kernel.dmg
           ls /Volumes/prism-kernel
           test -d '/Volumes/prism-kernel/Chromium.app' || { echo 'DMG 中没有找到 Chromium.app'; exit 1; }
